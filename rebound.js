@@ -33,49 +33,18 @@ require(["base", "raphael-min.js"], function(Base) {
 
         setAttribute : function(name, value) {
             var oldValue = this[name];
-            this[name] = value;
+            if (typeof value === "string" ) {
+                this.$bindings[name] = new Rebound.Binding(this, name, value);
+                this[name] = this.$bindings[name].evaluate();
+            } else {
+                this[name] = value;
+            }
             this.emit("change:" + name, oldValue, value);
             return this[name];
         },
 
         getAttribute : function(name) {
             return this[name];
-        }
-    });
-
-    Rebound.Binding = Base.extend({
-        constructor : function(expression, object, attributeName) {
-            this.expression     = Rebound.Expressions.Parser.parse(expression);
-            this.object         = object;
-            this.attributeName  = attributeName;
-
-            // Get all the references in the expression
-            var uncheckedExpressions = [this.expression];
-            var references = [];
-            while (uncheckedExpressions.length > 0) {
-                var expression = uncheckedExpressions.pop();
-                if (expression instanceof Rebound.Expressions.Reference) {
-                    references.push(expression);
-                } else {
-                    uncheckedExpressions = uncheckedExpressions.concat(expression.getChildren());
-                }
-            }
-
-            // Update the attribute whenever any of its references change
-            for (var i = 0; i < references.length; i++) {
-                var reference = references[i];
-                var self = this;
-                reference.getObject().on(
-                    "change:" + reference.getAttributeName(),
-                    function() {
-                        object.setAttribute(attributeName, self.evaluate());
-                    }
-                )
-            }
-        },
-
-        evaluate : function() {
-            return this.expression.evaluate();
         }
     });
 
@@ -95,7 +64,7 @@ require(["base", "raphael-min.js"], function(Base) {
 
             // If it has a special attribute handler, call it.
             if (this.$attributeHandlers[name]) {
-                this.$attributeHandlers[name].call(this, value);
+                this.$attributeHandlers[name].call(this, this.getAttribute(name));
             }
         },
 
@@ -108,7 +77,7 @@ require(["base", "raphael-min.js"], function(Base) {
 
             // If it's a style attribute pass it on to the Raphael element.
             if (Rebound.Drawable.styleAttributes.indexOf(name) != -1) {
-                this.setElementAttribute(name, value);
+                this.setElementAttribute(name, this.getAttribute(name));
             }
         },
 
@@ -196,6 +165,7 @@ require(["base", "raphael-min.js"], function(Base) {
         
             position : function(value) {
                 // Don't use setAttribute here otherwise we'll end up in a loop;
+                // TODO: But we need to to trigger x and y event handlers!
                 this.x = value[0];
                 this.y = value[1];
 
@@ -234,131 +204,73 @@ require(["base", "raphael-min.js"], function(Base) {
         } 
     });
 
-    Rebound.Expressions = {};
-    Rebound.Expressions.Addition = Base.extend({
-        constructor : function(terms) {
-            this.$terms = terms;
-        },
+    // Binds an objects attribute to some expression which can depend on
+    // other objects and values. Whenever these other objects are updated,
+    // the bound attribute is also updated. Bindings should be passed as 
+    // a javascript expression with external attributes wrapped in { and }:
+    //     {point.x} + 5
+    // or
+    //     distance({line.begin}, {line.end})
+    Rebound.Binding = Base.extend({
+        constructor: function(object, attribute, expression) {
+            this.object     = object;
+            this.attribute  = attribute;
+            this.expression = expression;
+            this.references = [];
 
-        toString : function() {
-            var stringTerms = [];
-            for (var i = 0; i < this.$terms.length; i++) {
-                stringTerms.push(this.$terms[i].toString());
+            // Find any references to outside values
+            var m = expression.match(/\{[^\}]*\}/g) || [];
+            var referenceStrings = [];
+            for (var i = 0; i < m.length; i++) {
+                // Get reference without { and }
+                var reference = m[i].slice(1, -1);
+
+                // Avoid duplicates
+                if (referenceStrings.indexOf(reference) == -1) {
+                    referenceStrings.push(reference);
+
+                    this.expression = this.expression.replace(
+                        RegExp("{" + reference + "}", "g"),
+                        reference
+                    );
+                }
             }
-            return "(" + stringTerms.join(" + ") + ")";
-        },
 
-        evaluate : function() {
-            var total = 0;
-            for (var i = 0; i < this.$terms.length; i++ ) {
-                total += this.$terms[i].evaluate();
+            // Get each reference and find the object it refers to
+            for (i = 0; i < referenceStrings.length; i++) {
+                var reference      = referenceStrings[i];
+                var attributeChain = reference.split(".");
+
+                var object = window;
+                var attribute;
+                while (attributeChain.length > 1) {
+                    attribute = attributeChain.shift();
+                    object = object[attribute];
+                    // TODO: Handle null objects
+                }
+                attribute = attributeChain.shift();
+
+                this.references.push({
+                    object    : object,
+                    attribute : attribute
+                })
             }
-            return total;
-        },
 
-        getChildren : function() {
-            return this.$terms;
-        }
-    });
-
-    Rebound.Expressions.Multiplication = Base.extend({
-        constructor : function(terms) {
-            this.$terms = terms;
-        },
-
-        toString : function() {
-            var stringTerms = [];
-            for (var i = 0; i < this.$terms.length; i++) {
-                stringTerms.push(this.$terms[i].toString());
-            }
-            return "(" + stringTerms.join(" * ") + ")";
-        },
-
-        evaluate : function() {
-            var product = 1;
-            for (var i = 0; i < this.$terms.length; i++) {
-                product *= this.$terms[i].evaluate();
-            }
-            return product;
-        },
-
-        getChildren : function() {
-            return this.$terms;
-        }
-    });
-
-    Rebound.Expressions.Exponential = Base.extend({
-        constructor : function(base, exponent) {
-            this.$base     = base;
-            this.$exponent = exponent;
-        },
-
-        toString : function() {
-            return "(" + this.$base.toString() + "^" + this.$exponent.toString() + ")";
-        },
-
-        evaluate : function() {
-            return Math.pow(this.$base.evaluate(), this.$exponent.evaluate());
-        },
-
-        getChildren : function() {
-            return [this.$base, this.$exponent];
-        }
-    });
-
-    Rebound.Expressions.Number = Base.extend({
-        constructor : function(value) {
-            this.$value = value;
-        },
-
-        toString : function() {
-            return this.$value + "";
-        },
-
-        evaluate : function() {
-            return this.$value;
-        },
-
-        getChildren : function() {
-            return [];
-        }
-    });
-
-    // Reference is passed in from the parser as an array of 
-    // attributes names. The array ["window", "point", "x"] would
-    // correspond to the object window.point and the attribute x.
-    Rebound.Expressions.Reference = Base.extend({
-        constructor: function(reference) {
-            this.$name = reference.join(".");
-
-            this.$attributeName = reference.pop();
-
-            // Hack for now since we don't have any global objects
-            var window = require("./window");
-            this.$object = window;
-            for (var i = 0; i < reference.length; i++) {
-                this.$object = this.$object[reference[i]];
+            // Listen for updates to any of the references
+            for (i = 0; i < this.references.length; i++) {
+                var object    = this.references[i].object;
+                var attribute = this.references[i].attribute;
+                var self      = this;
+                if (typeof object.on === "function") {
+                    object.on("change:" + attribute, function(oldValue, newValue) {
+                        self.object.setAttribute(attribute, self.evaluate());
+                    });
+                }
             }
         },
 
-        toString : function() {
-            return "{" + this.$name + "}";
-        },
-
         evaluate : function() {
-            return this.$object[this.$attributeName];
-        },
-
-        getChildren : function() {
-            return [];
-        },
-
-        getObject : function() {
-            return this.$object;
-        },
-
-        getAttributeName : function() {
-            return this.$attributeName;
+            return eval(this.expression);
         }
     });
 });
