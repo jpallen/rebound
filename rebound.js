@@ -1,5 +1,5 @@
-require(["base", "raphael-min.js"], function(Base) {
-    window.Rebound = {};
+define(["base", "raphael-min.js"], function(Base) {
+    var Rebound = {};
 
     Rebound.EventEmitter = Base.extend({
         constructor : function() {
@@ -39,7 +39,9 @@ require(["base", "raphael-min.js"], function(Base) {
             } else {
                 this[name] = value;
             }
+
             this.emit("change:" + name, oldValue, value);
+
             return this[name];
         },
 
@@ -59,12 +61,18 @@ require(["base", "raphael-min.js"], function(Base) {
             }
         },
 
-        setAttribute : function(name, value) {
+        setAttribute : function(name, value, callHandler) {
             Rebound.ValueWatcher.prototype.setAttribute.call(this, name, value);
 
+            if (typeof callHandler === "undefined") {
+                callHandler = true;
+            }
+
             // If it has a special attribute handler, call it.
-            if (this.$attributeHandlers[name]) {
-                this.$attributeHandlers[name].call(this, this.getAttribute(name));
+            if (callHandler) {
+                if (this.$attributeHandlers[name]) {
+                    this.$attributeHandlers[name].call(this, this.getAttribute(name));
+                }
             }
         },
 
@@ -72,8 +80,8 @@ require(["base", "raphael-min.js"], function(Base) {
     });
 
     Rebound.Drawable = Rebound.Object.extend({
-        setAttribute : function(name, value) {
-            Rebound.Object.prototype.setAttribute.call(this, name, value);
+        setAttribute : function(name, value, callHandler) {
+            Rebound.Object.prototype.setAttribute.call(this, name, value, callHandler);
 
             // If it's a style attribute pass it on to the Raphael element.
             if (Rebound.Drawable.styleAttributes.indexOf(name) != -1) {
@@ -123,7 +131,7 @@ require(["base", "raphael-min.js"], function(Base) {
             return this;
         },
 
-        // SVG draws from the top left, with x goign right and ty going down
+        // SVG draws from the top left, with x going right and y going down
         // but we want to draw from the center with x going right and y going up.
         getCanvasX : function(x) {
             return x + this.width / 2;
@@ -136,6 +144,13 @@ require(["base", "raphael-min.js"], function(Base) {
                 this.getCanvasX(coord[0]),
                 this.getCanvasY(coord[1])
             ];
+        },
+
+        getPhysicalXOffset : function(x) {
+            return x;
+        },
+        getPhysicalYOffset : function(y) {
+            return -y;
         }
     });
 
@@ -146,33 +161,34 @@ require(["base", "raphael-min.js"], function(Base) {
                 this.$canvas.getCanvasY(this.getAttribute("y")),
                 4
             );
+            this.$element.attr({
+                fill   : "#245D70",
+                stroke : "#1D2224"
+            });
         },
 
         $attributeHandlers : {
             x : function(value) {
-                this.setAttribute("position", [
-                    value,
-                    this.getAttribute("y")
-                ]);
+                this.setAttribute("position", [value, this.y], false);
+                this.$updatePosition();
             },
 
             y : function(value) {
-                this.setAttribute("position", [
-                    this.getAttribute("x"),
-                    value
-                ]);
+                this.setAttribute("position", [this.x, value], false);
+                this.$updatePosition();
             },
         
             position : function(value) {
-                // Don't use setAttribute here otherwise we'll end up in a loop;
-                // TODO: But we need to to trigger x and y event handlers!
-                this.x = value[0];
-                this.y = value[1];
+                this.setAttribute("x", value[0], false);
+                this.setAttribute("y", value[1], false);
+                this.$updatePosition();
+            }
+        },
 
-                if (this.$element) {
-                    this.setElementAttribute("cx", this.$canvas.getCanvasX(this.x));
-                    this.setElementAttribute("cy", this.$canvas.getCanvasY(this.y));
-                }
+        $updatePosition : function() {
+            if (this.$element) {
+                this.setElementAttribute("cx", this.$canvas.getCanvasX(this.x));
+                this.setElementAttribute("cy", this.$canvas.getCanvasY(this.y));
             }
         }
     });
@@ -191,17 +207,83 @@ require(["base", "raphael-min.js"], function(Base) {
 
         $attributeHandlers : {
             begin : function(value) {
-                if (this.$element) {
-                    this.setElementAttribute("path", this.$getPathString());
-                }
+                this.$updateLength();
+                this.$updateDirection();
+                this.$updatePath();
             },
 
             end : function(value) {
-                if (this.$element) {
-                    this.setElementAttribute("path", this.$getPathString());
-                }
+                this.$updateLength();
+                this.$updateDirection();
+                this.$updatePath();
+            },
+
+            direction : function(value) {
+                this.$updateEnd();
+                this.$updatePath();
+            },
+
+            length : function(value) {
+                this.$updateEnd();
+                this.$updatePath();
             }
-        } 
+        },
+
+        $isInitialized : function () {
+            return typeof this.begin !== "undefined" && typeof this.end !== "undefined";
+        },
+
+        $updatePath : function() {
+            if (this.$element) {
+                this.setElementAttribute("path", this.$getPathString());
+            }
+        },
+
+        $updateDirection : function() {
+            if (this.$isInitialized()) {
+                var direction     = [this.end[0] - this.begin[0], this.end[1] - this.begin[1]];
+                var magnitude     = Math.sqrt(direction[0] * direction[0] + direction[1] * direction[1]);
+                var unitDirection = [direction[0] / magnitude, direction[1] / magnitude];
+                this.setAttribute("direction", unitDirection, false);
+            }
+        },
+
+        $updateLength : function () {
+            if (this.$isInitialized()) {
+                var length = Math.sqrt(
+                    Math.pow(this.end[0] - this.begin[0], 2) +
+                    Math.pow(this.end[1] - this.begin[1], 2)
+                );
+                this.setAttribute("length", length, false);
+            }
+        },
+
+        $updateEnd : function () {
+            if (this.$isInitialized()) {
+                this.setAttribute("end", [
+                    this.begin[0] + this.direction[0] * this.length,
+                    this.begin[1] + this.direction[1] * this.length
+                ], false);
+            }
+        }
+    });
+
+    Rebound.Draggable = Base.extend({
+        constructor : function(object) {
+            this.object = object;
+
+            this.object.$element.drag(
+                function(dx, dy) {
+                    object.setAttribute("x", this.ox + object.$canvas.getPhysicalXOffset(dx));
+                    object.setAttribute("y", this.oy + object.$canvas.getPhysicalYOffset(dy));
+                },
+                function() {
+                    this.ox = object.getAttribute("x");
+                    this.oy = object.getAttribute("y");
+                },
+                function () {}
+            );
+        }
     });
 
     // Binds an objects attribute to some expression which can depend on
@@ -258,12 +340,12 @@ require(["base", "raphael-min.js"], function(Base) {
 
             // Listen for updates to any of the references
             for (i = 0; i < this.references.length; i++) {
-                var object    = this.references[i].object;
-                var attribute = this.references[i].attribute;
+                var watchObject    = this.references[i].object;
+                var watchAttribute = this.references[i].attribute;
                 var self      = this;
-                if (typeof object.on === "function") {
-                    object.on("change:" + attribute, function(oldValue, newValue) {
-                        self.object.setAttribute(attribute, self.evaluate());
+                if (typeof watchObject.on === "function") {
+                    watchObject.on("change:" + watchAttribute, function(oldValue, newValue) {
+                        self.object.setAttribute(self.attribute, self.evaluate());
                     });
                 }
             }
@@ -273,4 +355,6 @@ require(["base", "raphael-min.js"], function(Base) {
             return eval(this.expression);
         }
     });
+
+    return Rebound;
 });
