@@ -268,6 +268,30 @@ define(["base", "raphael-min.js"], function(Base) {
         }
     });
 
+    Rebound.Plot = Rebound.Drawable.extend({
+        $draw : function() {
+            this.$element = this.$canvas.$element.path(this.$getPathString());
+        },
+
+        $getPathString : function() {
+            var path  = "";
+            var range = this.getAttribute("range");
+
+            for (var i = 0; i <= 300; i++ ) {
+                var x = range[0] + i/300.0 * (range[1] - range[0]);
+                console.log(x);
+                if (i == 0) {
+                    path += "M";
+                } else {
+                    path += "L";
+                }
+                path += this.$canvas.getCanvasX(x) + " " + this.$canvas.getCanvasY(this.getAttribute("function")(x));
+            }
+
+            return path
+        }
+    });
+
     Rebound.Draggable = Base.extend({
         constructor : function(object) {
             this.object = object;
