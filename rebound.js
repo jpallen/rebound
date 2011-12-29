@@ -1,6 +1,12 @@
 define(["base", "raphael-min.js"], function(Base) {
     var Rebound = {};
 
+    Rebound.EventChain = Base.extend({
+        constructor : function() {
+            this.previouslyCalled = [];
+        }
+    });
+
     Rebound.EventEmitter = Base.extend({
         constructor : function() {
             this.eventCallbacks = {};
@@ -13,12 +19,28 @@ define(["base", "raphael-min.js"], function(Base) {
         },
 
         emit : function(event) {
-            var argv = Array.prototype.slice.call(arguments, 1)
+            var argv = Array.prototype.slice.call(arguments, 1);
+            
+            if (!(argv[0] instanceof Rebound.EventChain)) {
+                argv.unshift(new Rebound.EventChain());
+            }
+            var e = argv[0];
 
             var callbacks = this.eventCallbacks[event];
             if (callbacks) {
-                for (var i = 0; i < callbacks.length; i++ ) {
-                    callbacks[i].apply(this, argv);
+                for (var i = 0; i < callbacks.length; i++ ) {   
+                    var callback = callbacks[i];
+                    // Check callback hasn't already been called
+                    if (e.previouslyCalled.indexOf(callback) == -1) {
+                        // We only keep track of callbacks called on the way down
+                        // one branch of the callback tree. The same callback may
+                        // need calling multiple times if called by different parent
+                        // callbacks. 
+                        // THIS WILL NOT WORK ASYNCHRONOUSLY!
+                        e.previouslyCalled.push(callback);
+                        callback.apply(this, argv);
+                        e.previouslyCalled.pop();
+                    }
                 }
             }
             return this;
@@ -31,7 +53,7 @@ define(["base", "raphael-min.js"], function(Base) {
             this.$bindings = {};
         },
 
-        setAttribute : function(name, value) {
+        setAttribute : function(name, value, eventChain) {
             var oldValue = this[name];
             if (typeof value === "string" ) {
                 this.$bindings[name] = new Rebound.Binding(this, name, value);
@@ -40,7 +62,10 @@ define(["base", "raphael-min.js"], function(Base) {
                 this[name] = value;
             }
 
-            this.emit("change:" + name, oldValue, value);
+            if (!eventChain) {
+                eventChain = new Rebound.EventChain();
+            }
+            this.emit("attribute:" + name + ":update", eventChain, oldValue, value);
 
             return this[name];
         },
@@ -59,20 +84,9 @@ define(["base", "raphael-min.js"], function(Base) {
                     this.setAttribute(name, attributes[name]);
                 }
             }
-        },
 
-        setAttribute : function(name, value, callHandler) {
-            Rebound.ValueWatcher.prototype.setAttribute.call(this, name, value);
-
-            if (typeof callHandler === "undefined") {
-                callHandler = true;
-            }
-
-            // If it has a special attribute handler, call it.
-            if (callHandler) {
-                if (this.$attributeHandlers[name]) {
-                    this.$attributeHandlers[name].call(this, this.getAttribute(name));
-                }
+            if (typeof this.registerEventListeners === "function") {
+                this.registerEventListeners();
             }
         },
 
@@ -80,8 +94,8 @@ define(["base", "raphael-min.js"], function(Base) {
     });
 
     Rebound.Drawable = Rebound.Object.extend({
-        setAttribute : function(name, value, callHandler) {
-            Rebound.Object.prototype.setAttribute.call(this, name, value, callHandler);
+        setAttribute : function(name, value, e) {
+            Rebound.Object.prototype.setAttribute.call(this, name, value, e);
 
             // If it's a style attribute pass it on to the Raphael element.
             if (Rebound.Drawable.styleAttributes.indexOf(name) != -1) {
@@ -155,6 +169,23 @@ define(["base", "raphael-min.js"], function(Base) {
     });
 
     Rebound.Point = Rebound.Drawable.extend({
+        registerEventListeners : function(attributes) {
+            var self = this;
+            this.on("attribute:x:update", function(e, oldValue, newValue) {
+                self.setAttribute("position", [newValue, self.y], e);
+                self.$updatePosition();
+            });
+            this.on("attribute:y:update", function(e, oldValue, newValue) {
+                self.setAttribute("position", [self.x, newValue], e);
+                self.$updatePosition();
+            });
+            this.on("attribute:position:update", function(e, oldValue, newValue) {
+                self.setAttribute("x", newValue[0], e);
+                self.setAttribute("y", newValue[1], e);
+                self.$updatePosition();
+            })
+        },
+
         $draw : function() {
             this.$element = this.$canvas.$element.circle(
                 this.$canvas.getCanvasX(this.getAttribute("x")),
@@ -193,7 +224,40 @@ define(["base", "raphael-min.js"], function(Base) {
         }
     });
 
+    /* TODO:
+     * A line can be specified in multiple ways:
+     * 1) Exactly two of `begin`, `end`, `midpoint`,
+     * 2) `gradient`, `length` and one of `begin`, `end`, or `midpoint`,
+     * 3) `direction`, `length` and one of `begin`, `end`, or `midpoint`.
+     * 
+     * In the case of (1), any further update to one of the points will move
+     * only that point while leaving the other fixed.
+     * In the case of (2) or (3), any further updates to the specified point
+     * will translate the line, thus leaving `length` and `gradient` or `direction`
+     * fixed.
+     * END TODO
+     */
     Rebound.Line = Rebound.Drawable.extend({
+        registerEventListeners : function() {
+            var self = this;
+            this.on("attribute:begin:update", function(e, oldValue, newValue) {
+                self.$updateDirection(e);
+                self.$updateLength(e);
+                self.$updatePath(e);
+            });
+            this.on("attribute:end:update", function(e, oldValue, newValue) {
+                self.$updateDirection(e);
+                self.$updateLength(e);
+                self.$updatePath(e);
+            });
+            this.on("attribute:direction:update", function(e, oldValue, newValue) {
+                self.$updatePath(e);
+            });
+            this.on("attribute:length:update", function(e, oldValue, newValue) {
+                self.$updatePath(e);
+            });
+        },
+
         $draw : function() {
             this.$element = this.$canvas.$element.path(this.$getPathString());
         },
@@ -205,81 +269,70 @@ define(["base", "raphael-min.js"], function(Base) {
                    "L" + end[0]   + " " + end[1];
         },
 
-        $attributeHandlers : {
-            begin : function(value) {
-                this.$updateLength();
-                this.$updateDirection();
-                this.$updatePath();
-            },
-
-            end : function(value) {
-                this.$updateLength();
-                this.$updateDirection();
-                this.$updatePath();
-            },
-
-            direction : function(value) {
-                this.$updateEnd();
-                this.$updatePath();
-            },
-
-            length : function(value) {
-                this.$updateEnd();
-                this.$updatePath();
-            }
-        },
-
         $isInitialized : function () {
             return typeof this.begin !== "undefined" && typeof this.end !== "undefined";
         },
 
-        $updatePath : function() {
+        $updatePath : function(e) {
             if (this.$element) {
-                this.setElementAttribute("path", this.$getPathString());
+                this.setElementAttribute("path", this.$getPathString(), e);
             }
         },
 
-        $updateDirection : function() {
+        $updateDirection : function(e) {
             if (this.$isInitialized()) {
                 var direction     = [this.end[0] - this.begin[0], this.end[1] - this.begin[1]];
                 var magnitude     = Math.sqrt(direction[0] * direction[0] + direction[1] * direction[1]);
                 var unitDirection = [direction[0] / magnitude, direction[1] / magnitude];
-                this.setAttribute("direction", unitDirection, false);
+                this.setAttribute("direction", unitDirection, e);
             }
         },
 
-        $updateLength : function () {
+        $updateLength : function (e) {
             if (this.$isInitialized()) {
                 var length = Math.sqrt(
                     Math.pow(this.end[0] - this.begin[0], 2) +
                     Math.pow(this.end[1] - this.begin[1], 2)
                 );
-                this.setAttribute("length", length, false);
+                this.setAttribute("length", length, e);
             }
         },
 
-        $updateEnd : function () {
+        $updateEnd : function (e) {
             if (this.$isInitialized()) {
                 this.setAttribute("end", [
                     this.begin[0] + this.direction[0] * this.length,
                     this.begin[1] + this.direction[1] * this.length
-                ], false);
+                ], e);
             }
         }
     });
 
     Rebound.Plot = Rebound.Drawable.extend({
+        registerEventListeners : function() {
+            var self = this;
+            this.on("attribute:function:update", function(e, oldValue, newValue) {
+                self.$draw();
+            })
+        },
+
         $draw : function() {
-            this.$element = this.$canvas.$element.path(this.$getPathString());
+            if (this.$canvas) {
+                if (this.$element) {
+                    this.setElementAttribute("path", this.$getPathString());
+                } else {
+                    this.$element = this.$canvas.$element.path(this.$getPathString());
+                }
+            }
         },
 
         $getPathString : function() {
             var path  = "";
             var range = this.getAttribute("range");
 
-            for (var i = 0; i <= 300; i++ ) {
-                var x = range[0] + i/300.0 * (range[1] - range[0]);
-                console.log(x);
+            var steps = (range[1] - range[0]) * 1.0;
+            for (var i = 0; i <= steps; i++ ) {
+                var x = range[0] + i/steps * (range[1] - range[0]);
                 if (i == 0) {
                     path += "M";
                 } else {
@@ -299,7 +352,7 @@ define(["base", "raphael-min.js"], function(Base) {
             this.object.$element.drag(
                 function(dx, dy) {
                     object.setAttribute("x", this.ox + object.$canvas.getPhysicalXOffset(dx));
-                    object.setAttribute("y", this.oy + object.$canvas.getPhysicalYOffset(dy));
+                    //object.setAttribute("y", this.oy + object.$canvas.getPhysicalYOffset(dy));
                 },
                 function() {
                     this.ox = object.getAttribute("x");
@@ -325,18 +378,18 @@ define(["base", "raphael-min.js"], function(Base) {
             this.references = [];
 
             // Find any references to outside values
-            var m = expression.match(/\{[^\}]*\}/g) || [];
+            var m = expression.match(/\{![^\}]*\}/g) || [];
             var referenceStrings = [];
             for (var i = 0; i < m.length; i++) {
-                // Get reference without { and }
-                var reference = m[i].slice(1, -1);
+                // Get reference without {! and }
+                var reference = m[i].slice(2, -1);
 
                 // Avoid duplicates
                 if (referenceStrings.indexOf(reference) == -1) {
                     referenceStrings.push(reference);
 
                     this.expression = this.expression.replace(
-                        RegExp("{" + reference + "}", "g"),
+                        RegExp("{!" + reference + "}", "g"),
                         reference
                     );
                 }
@@ -368,15 +421,17 @@ define(["base", "raphael-min.js"], function(Base) {
                 var watchAttribute = this.references[i].attribute;
                 var self      = this;
                 if (typeof watchObject.on === "function") {
-                    watchObject.on("change:" + watchAttribute, function(oldValue, newValue) {
-                        self.object.setAttribute(self.attribute, self.evaluate());
+                    watchObject.on("attribute:" + watchAttribute + ":update", function(e, oldValue, newValue) {
+                        self.object.setAttribute(self.attribute, self.evaluate(), e);
                     });
                 }
             }
         },
 
         evaluate : function() {
-            return eval(this.expression);
+            var value;
+            eval("value = (" + this.expression + ")");
+            return value;
         }
     });
 
